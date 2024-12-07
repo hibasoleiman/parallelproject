@@ -12,23 +12,67 @@
 
 #define FOREACH(i,count) for (int i = 0; i < count; ++i)
 
-#define CONVOLUTE_VALID(input,output,weight)											\
-{																						\
-	FOREACH(o0,GETLENGTH(output))														\
-		FOREACH(o1,GETLENGTH(*(output)))												\
-			FOREACH(w0,GETLENGTH(weight))												\
-				FOREACH(w1,GETLENGTH(*(weight)))										\
-					(output)[o0][o1] += (input)[o0 + w0][o1 + w1] * (weight)[w0][w1];	\
+
+#define CONVOLUTE_VALID(input, output, weight) {                                 \
+    int rank, size;                                                             \
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);                                        \
+    MPI_Comm_size(MPI_COMM_WORLD, &size);                                        \
+                                                                                \
+    int rows_per_process = GETLENGTH(output) / size;                            \
+    int start_row = rank * rows_per_process;                                    \
+    int end_row = (rank + 1) * rows_per_process;                                \
+                                                                                \
+    /* Last process takes remaining rows */                                     \
+    if (rank == size - 1) {                                                      \
+        end_row = GETLENGTH(output);                                             \
+    }                                                                           \
+                                                                                \
+    /* Perform convolution for the assigned rows */                              \
+    for (int o0 = start_row; o0 < end_row; o0++) {                              \
+        for (int o1 = 0; o1 < GETLENGTH(*(output)); o1++) {                      \
+            for (int w0 = 0; w0 < GETLENGTH(weight); w0++) {                     \
+                for (int w1 = 0; w1 < GETLENGTH(*(weight)); w1++) {             \
+                    (output)[o0][o1] += (input)[o0 + w0][o1 + w1] * (weight)[w0][w1]; \
+                }                                                               \
+            }                                                                   \
+        }                                                                       \
+    }                                                                           \
+                                                                                \
+    /* Gather the results from all processes to rank 0 */                        \
+    MPI_Gather((output) + start_row, rows_per_process * GETLENGTH(*(output)),    \
+               MPI_DOUBLE, (output), rows_per_process * GETLENGTH(*(output)),    \
+               MPI_DOUBLE, 0, MPI_COMM_WORLD);                                  \
 }
 
-#define CONVOLUTE_FULL(input,output,weight)												\
-{																						\
-	FOREACH(i0,GETLENGTH(input))														\
-		FOREACH(i1,GETLENGTH(*(input)))													\
-			FOREACH(w0,GETLENGTH(weight))												\
-				FOREACH(w1,GETLENGTH(*(weight)))										\
-					(output)[i0 + w0][i1 + w1] += (input)[i0][i1] * (weight)[w0][w1];	\
+
+#define CONVOLUTE_FULL(input, output, weight) \
+{ \
+    int rank, size; \
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank); \
+    MPI_Comm_size(MPI_COMM_WORLD, &size); \
+    \
+    /* Divide the input into blocks of rows per process */ \
+    int local_rows = GETLENGTH(input) / size; \
+    int start_row = rank * local_rows; \
+    int end_row = (rank == size - 1) ? GETLENGTH(input) : start_row + local_rows; \
+    \
+    /* Perform the convolution operation on the local segment */ \
+    for (int i0 = start_row; i0 < end_row; i0++) { \
+        for (int i1 = 0; i1 < GETLENGTH(*(input)); i1++) { \
+            for (int w0 = 0; w0 < GETLENGTH(weight); w0++) { \
+                for (int w1 = 0; w1 < GETLENGTH(*(weight)); w1++) { \
+                    (output)[i0 + w0][i1 + w1] += (input)[i0][i1] * (weight)[w0][w1]; \
+                } \
+            } \
+        } \
+    } \
+    \
+    /* Gather the results back to the root process */ \
+    MPI_Gather(output + start_row, local_rows * GETLENGTH(*(output)), MPI_DOUBLE, \
+               output, local_rows * GETLENGTH(*(output)), MPI_DOUBLE, \
+               0, MPI_COMM_WORLD); \
 }
+
 
 #define CONVOLUTION_FORWARD(input,output,weight,bias,action)					\
 {																				\
@@ -96,28 +140,103 @@
 	}																							\
 }
 
-#define DOT_PRODUCT_FORWARD(input,output,weight,bias,action)				\
-{																			\
-	for (int x = 0; x < GETLENGTH(weight); ++x)								\
-		for (int y = 0; y < GETLENGTH(*weight); ++y)						\
-			((double *)output)[y] += ((double *)input)[x] * weight[x][y];	\
-	FOREACH(j, GETLENGTH(bias))												\
-		((double *)output)[j] = action(((double *)output)[j] + bias[j]);	\
+#define DOT_PRODUCT_FORWARD_MPI(input, output, weight, bias, action) \
+{ \
+    /* Get rank and size within the function */ \
+    int rank, size; \
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank); \
+    MPI_Comm_size(MPI_COMM_WORLD, &size); \
+    \
+    int total_output_size = GETLENGTH(output); \
+    int local_output_size = total_output_size / size; \
+    int start_idx = rank * local_output_size; \
+    int end_idx = (rank == size - 1) ? total_output_size : start_idx + local_output_size; \
+    \
+    /* Local pointer for output to reduce redundant memory accesses */ \
+    double *local_output = (double *)output + start_idx; \
+    \
+    /* Perform the dot product computation for each output element */ \
+    for (int y = start_idx; y < end_idx; ++y) { \
+        local_output[y - start_idx] = 0.0; /* Initialize output element to 0 */ \
+        for (int x = 0; x < GETLENGTH(weight); ++x) { \
+            local_output[y - start_idx] += ((double *)input)[x] * weight[x][y]; \
+        } \
+        local_output[y - start_idx] = action(local_output[y - start_idx] + bias[y]); \
+    } \
+    \
+    /* Gather the computed output values from all processes to the root (rank 0) */ \
+    MPI_Gather(local_output, local_output_size, MPI_DOUBLE, \
+               output, local_output_size, MPI_DOUBLE, \
+               0, MPI_COMM_WORLD); \
 }
 
-#define DOT_PRODUCT_BACKWARD(input,inerror,outerror,weight,wd,bd,actiongrad)	\
-{																				\
-	for (int x = 0; x < GETLENGTH(weight); ++x)									\
-		for (int y = 0; y < GETLENGTH(*weight); ++y)							\
-			((double *)inerror)[x] += ((double *)outerror)[y] * weight[x][y];	\
-	FOREACH(i, GETCOUNT(inerror))												\
-		((double *)inerror)[i] *= actiongrad(((double *)input)[i]);				\
-	FOREACH(j, GETLENGTH(outerror))												\
-		bd[j] += ((double *)outerror)[j];										\
-	for (int x = 0; x < GETLENGTH(weight); ++x)									\
-		for (int y = 0; y < GETLENGTH(*weight); ++y)							\
-			wd[x][y] += ((double *)input)[x] * ((double *)outerror)[y];			\
+
+
+#define DOT_PRODUCT_BACKWARD_MPI(input, inerror, outerror, weight, wd, bd, actiongrad)	\
+{																					\
+    /* Declare rank and size inside the function */									\
+    int rank, size;																\
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);											\
+    MPI_Comm_size(MPI_COMM_WORLD, &size);											\
+																					\
+    /* Get dimensions of weight and error arrays */								\
+    int weight_rows = GETLENGTH(weight);											\
+    int weight_cols = GETLENGTH(*weight);											\
+    int error_size = GETLENGTH(outerror);											\
+    int input_size = GETCOUNT(inerror);											\
+																					\
+    /* Divide workload for each rank (splitting rows of weight matrix) */			\
+    int local_rows = weight_rows / size;											\
+    int start_row = rank * local_rows;												\
+    int end_row = (rank == size - 1) ? weight_rows : start_row + local_rows;		\
+																					\
+    /* Step 1: Parallel computation of inerror */									\
+    for (int x = start_row; x < end_row; ++x) {									\
+        for (int y = 0; y < weight_cols; ++y) {									\
+            ((double *)inerror)[x] += ((double *)outerror)[y] * weight[x][y];		\
+        }																			\
+    }																				\
+																					\
+    /* Apply the gradient of the activation function for each input element */		\
+    for (int i = rank; i < input_size; i += size) {								\
+        ((double *)inerror)[i] *= actiongrad(((double *)input)[i]);				\
+    }																				\
+																					\
+    /* Step 2: Parallel computation of bias gradients (bd) */						\
+    double *local_bd = (double *)calloc(error_size, sizeof(double));				\
+    for (int j = rank; j < error_size; j += size) {								\
+        local_bd[j] += ((double *)outerror)[j];									\
+    }																				\
+																					\
+    /* Reduce bias gradients to the root (rank 0) */								\
+    MPI_Allreduce(MPI_IN_PLACE, local_bd, error_size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); \
+    if (rank == 0) {																\
+        for (int j = 0; j < error_size; ++j) {										\
+            bd[j] += local_bd[j];													\
+        }																			\
+    }																				\
+    free(local_bd);																\
+																					\
+    /* Step 3: Parallel computation of weight gradients (wd) */						\
+    double *local_wd = (double *)calloc(weight_rows * weight_cols, sizeof(double));\
+    for (int x = start_row; x < end_row; ++x) {									\
+        for (int y = 0; y < weight_cols; ++y) {									\
+            local_wd[x * weight_cols + y] += ((double *)input)[x] * ((double *)outerror)[y]; \
+        }																			\
+    }																				\
+																					\
+    /* Reduce weight gradients across all processes */								\
+    MPI_Allreduce(MPI_IN_PLACE, local_wd, weight_rows * weight_cols, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); \
+    if (rank == 0) {																\
+        for (int x = 0; x < weight_rows; ++x) {									\
+            for (int y = 0; y < weight_cols; ++y) {								\
+                wd[x][y] += local_wd[x * weight_cols + y];						\
+            }																		\
+        }																			\
+    }																				\
+    free(local_wd);																\
 }
+
 
 double relu(double x)
 {

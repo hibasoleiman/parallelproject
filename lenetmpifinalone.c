@@ -172,69 +172,57 @@
 
 
 
-#define DOT_PRODUCT_BACKWARD_MPI(input, inerror, outerror, weight, wd, bd, actiongrad)	\
-{																					\
-    /* Declare rank and size inside the function */									\
-    int rank, size;																\
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);											\
-    MPI_Comm_size(MPI_COMM_WORLD, &size);											\
-																					\
-    /* Get dimensions of weight and error arrays */								\
-    int weight_rows = GETLENGTH(weight);											\
-    int weight_cols = GETLENGTH(*weight);											\
-    int error_size = GETLENGTH(outerror);											\
-    int input_size = GETCOUNT(inerror);											\
-																					\
-    /* Divide workload for each rank (splitting rows of weight matrix) */			\
-    int local_rows = weight_rows / size;											\
-    int start_row = rank * local_rows;												\
-    int end_row = (rank == size - 1) ? weight_rows : start_row + local_rows;		\
-																					\
-    /* Step 1: Parallel computation of inerror */									\
-    for (int x = start_row; x < end_row; ++x) {									\
-        for (int y = 0; y < weight_cols; ++y) {									\
-            ((double *)inerror)[x] += ((double *)outerror)[y] * weight[x][y];		\
-        }																			\
-    }																				\
-																					\
-    /* Apply the gradient of the activation function for each input element */		\
-    for (int i = rank; i < input_size; i += size) {								\
-        ((double *)inerror)[i] *= actiongrad(((double *)input)[i]);				\
-    }																				\
-																					\
-    /* Step 2: Parallel computation of bias gradients (bd) */						\
-    double *local_bd = (double *)calloc(error_size, sizeof(double));				\
-    for (int j = rank; j < error_size; j += size) {								\
-        local_bd[j] += ((double *)outerror)[j];									\
-    }																				\
-																					\
-    /* Reduce bias gradients to the root (rank 0) */								\
-    MPI_Allreduce(MPI_IN_PLACE, local_bd, error_size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); \
-    if (rank == 0) {																\
-        for (int j = 0; j < error_size; ++j) {										\
-            bd[j] += local_bd[j];													\
-        }																			\
-    }																				\
-    free(local_bd);																\
-																					\
-    /* Step 3: Parallel computation of weight gradients (wd) */						\
-    double *local_wd = (double *)calloc(weight_rows * weight_cols, sizeof(double));\
-    for (int x = start_row; x < end_row; ++x) {									\
-        for (int y = 0; y < weight_cols; ++y) {									\
+#define DOT_PRODUCT_BACKWARD_MPI(input, inerror, outerror, weight, wd, bd, actiongrad)    \
+{                                                                                          \
+    /* Declare rank and size inside the function */                                         \
+    int rank, size;                                                                         \
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);                                                   \
+    MPI_Comm_size(MPI_COMM_WORLD, &size);                                                   \
+                                                                                           \
+    /* Get dimensions of weight and error arrays */                                         \
+    int weight_rows = GETLENGTH(weight);                                                    \
+    int weight_cols = GETLENGTH(*weight);                                                   \
+    int error_size = GETLENGTH(outerror);                                                   \
+    int input_size = GETCOUNT(inerror);                                                    \
+                                                                                           \
+    /* Divide workload for each rank (splitting rows of weight matrix) */                   \
+    int local_rows = weight_rows / size;                                                   \
+    int start_row = rank * local_rows;                                                      \
+    int end_row = (rank == size - 1) ? weight_rows : start_row + local_rows;               \
+                                                                                           \
+    /* Step 1: Parallel computation of inerror */                                          \
+    for (int x = start_row; x < end_row; ++x) {                                            \
+        for (int y = 0; y < weight_cols; ++y) {                                            \
+            ((double *)inerror)[x] += ((double *)outerror)[y] * weight[x][y];             \
+        }                                                                                  \
+    }                                                                                      \
+                                                                                           \
+    /* Apply the gradient of the activation function for each input element */             \
+    for (int i = rank; i < input_size; i += size) {                                        \
+        ((double *)inerror)[i] *= actiongrad(((double *)input)[i]);                        \
+    }                                                                                      \
+                                                                                           \
+    /* Step 2: Parallel computation of bias gradients (bd) */                              \
+    double *local_bd = (double *)calloc(error_size, sizeof(double));                       \
+    for (int j = rank; j < error_size; j += size) {                                         \
+        local_bd[j] += ((double *)outerror)[j];                                             \
+    }                                                                                      \
+                                                                                           \
+    /* Reduce bias gradients to the root (rank 0) */                                        \
+    MPI_Reduce(local_bd, bd, error_size, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);           \
+    free(local_bd);                                                                         \
+                                                                                           \
+    /* Step 3: Parallel computation of weight gradients (wd) */                             \
+    double *local_wd = (double *)calloc(weight_rows * weight_cols, sizeof(double));        \
+    for (int x = start_row; x < end_row; ++x) {                                            \
+        for (int y = 0; y < weight_cols; ++y) {                                            \
             local_wd[x * weight_cols + y] += ((double *)input)[x] * ((double *)outerror)[y]; \
-        }																			\
-    }																				\
-																					\
-    /* Reduce weight gradients across all processes */								\
-    MPI_Allreduce(MPI_IN_PLACE, local_wd, weight_rows * weight_cols, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD); \
-    if (rank == 0) {																\
-        for (int x = 0; x < weight_rows; ++x) {									\
-            for (int y = 0; y < weight_cols; ++y) {								\
-                wd[x][y] += local_wd[x * weight_cols + y];						\
-            }																		\
-        }																			\
-    }																				\
-    free(local_wd);																\
+        }                                                                                  \
+    }                                                                                      \
+                                                                                           \
+    /* Reduce weight gradients across all processes (only rank 0 gets the result) */       \
+    MPI_Reduce(local_wd, wd, weight_rows * weight_cols, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD); \
+    free(local_wd);                                                                         \
 }
 
 
